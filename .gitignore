@@ -423,3 +423,5 @@ src/azureml-api/src/BillingProcessor/out/*
 /src/aether/platform/backendV2/**/appsettings.override.json
 /src/azureml-api/msftkube
 /ManagedNetworkDemo/.vs/ManagedNetworkDemo/v17/.suo
+/ManagedNetworkDemo/appsettings.override.json
+/ManagedNetworkDemo/appsettings.json

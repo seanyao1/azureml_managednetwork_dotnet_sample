@@ -1,51 +1,66 @@
 ﻿using Azure;
 using Azure.Core;
-using Azure.Identity;
-using Azure.ResourceManager;
-using Azure.ResourceManager.KeyVault;
-using Azure.ResourceManager.KeyVault.Models;
-using Azure.ResourceManager.MachineLearning;
-using Azure.ResourceManager.MachineLearning.Models;
-using Azure.ResourceManager.Models;
-using Azure.ResourceManager.Resources;
-using Azure.ResourceManager.Storage;
-using Azure.ResourceManager.Storage.Models;
+using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json.Linq;
 using System;
+using System.Net.Http;
 using System.Threading.Tasks;
-using KeyVaultProperties = Azure.ResourceManager.KeyVault.Models.KeyVaultProperties;
 
 namespace ManagedNetworkDemo
 {
     internal class Program
     {
-        static Guid TenantId = Guid.Empty;
-
         static async Task Main(string[] args)
         {
             try
             {
-                ArmClient armClient = new ArmClient(new DefaultAzureCredential());
-                armClient.GetTenants();
+                // Security warning: The client secret should be stored securely and should not be hardcoded in code or a file.
+                var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", false, reloadOnChange: true).Build();
+                var tenantId = config["tenantId"];
 
-                // Create a resource identifier, then get the subscription resource
-                ResourceIdentifier resourceIdentifier =
-                    new ResourceIdentifier($"/subscriptions/{Constants.SubscriptionId}");
-                SubscriptionResource subscription = armClient.GetSubscriptionResource(resourceIdentifier);
-                var sub = await subscription.GetAsync();
-                subscription = sub.Value;
-                Program.TenantId = subscription.Data.TenantId.Value;
+                // Create a token fetcher to get the access token
+                var tokenFectcher = new TokenFetcher();
+                await tokenFectcher.InitializeAsync(tenantId, config["clientId"], config["clientKey"]).ConfigureAwait(false);  
+                
+                // Create a helper for calling ARM REST API:
+                var armInvoker = new AzureResourceManagerInvoker(tokenFectcher);
+                
+                //Get the subscription resource
+                var subscription = await armInvoker.GetSubscriptionAsync(Constants.SubscriptionId).ConfigureAwait(false);
 
                 // Create resource group
-                var resourceGroup = await CreateOrUpdateResourceGroup(subscription, Constants.ResourceGroupName);
-
-                // Create storage account
-                var storageAccount = await CreateOrUpdateStorageAccount(resourceGroup, Constants.StorageAccountName, Constants.StorageSku, Constants.Storagekind);
+                await armInvoker.CreateResourceGroupAsync(Constants.SubscriptionId, Constants.ResourceGroupName, Constants.Location.ToString()).ConfigureAwait(false);
 
                 // Create KV
-                var keyvault = await CreateOrUpdateKeyVault(resourceGroup, Constants.KeyVaultName);
+                var keyVault = await armInvoker.CreateKeyVault(Constants.SubscriptionId, Constants.ResourceGroupName, Constants.KeyVaultName, Constants.Location.ToString(), tenantId).ConfigureAwait(false);
 
-                // Create AzureML workspace
-                var workspace = await CreateOrUpdateWorkspace(resourceGroup, Constants.WorkspaceName, storageAccount, keyvault, Constants.AppInsightsArmId);
+                // Create storage account
+                var storageAccount = await armInvoker.CreateStorageAccount(Constants.SubscriptionId, Constants.ResourceGroupName, Constants.StorageAccountName, Constants.Location.ToString()).ConfigureAwait(false);
+                
+                // Create AzureML workspace, using managed network (AOAO mode)
+                var workspace = await armInvoker.CreateAzureMLWorkspace(
+                    Constants.SubscriptionId, 
+                    Constants.ResourceGroupName, 
+                    Constants.WorkspaceName, 
+                    Constants.Location.ToString(),
+                    storageResourceId: storageAccount.Value<string>("id"),
+                    kvResourceId: keyVault.Value<string>("id"),
+                    appInsightsResourceId: Constants.AppInsightsArmId
+                    ).ConfigureAwait(false);
+
+                // Call AzureML to proactively provision the managed network now.
+                var body = new JObject
+                {
+                    {"includeSpark", false }
+                };
+                var wsResourceId = workspace.Value<string>("id");
+                var provisionAction = ResourceIdentifier.Parse($"{wsResourceId}/provisionManagedNetwork");
+                Console.WriteLine($"Start provisioning managed network for workspace {wsResourceId}..");
+                var result = await armInvoker.CallApi(provisionAction, HttpMethod.Post, body, "2024-04-01");
+                Console.WriteLine($"Completed provisioning managed network for workspace {wsResourceId}, returned result: {result}");
+
+                //now youc can start create compute, online endopints in the workspace using the managed vnet. 
+                //....
 
                 Console.WriteLine("All done!");
             }
@@ -58,66 +73,6 @@ namespace ManagedNetworkDemo
                 Console.Out.WriteLine("Press any key to exit...");
                 Console.ReadKey();
             }
-        }
-
-        private static async Task<MachineLearningWorkspaceResource> CreateOrUpdateWorkspace(ResourceGroupResource resourceGroup, string workspaceName, StorageAccountResource storageAccount, KeyVaultResource keyvault, string appInsightsArmId)
-        {
-            Console.WriteLine("Creating AzureML workspace...");
-            var workspaceCollection = resourceGroup.GetMachineLearningWorkspaces();
-            var parameters = new MachineLearningWorkspaceData(Constants.Location)
-            {
-                PublicNetworkAccess = MachineLearningPublicNetworkAccess.Enabled,
-                ApplicationInsights = Constants.AppInsightsArmId,
-                Description = "Demo workspace for Managed Network Isolation feature",
-                FriendlyName = Constants.WorkspaceName,
-                Identity = new ManagedServiceIdentity(ManagedServiceIdentityType.SystemAssigned),
-                KeyVault = keyvault.Id,
-                StorageAccount = storageAccount.Id
-            };
-
-            var operation = await workspaceCollection.CreateOrUpdateAsync(WaitUntil.Completed, workspaceName, parameters);
-            var ws = operation.Value;
-            Console.WriteLine($"Workspace created: Id={ws.Id}");
-            return ws;
-        }
-
-        private static async Task<KeyVaultResource> CreateOrUpdateKeyVault(ResourceGroupResource resourceGroup, string keyVaultName)
-        {
-            Console.WriteLine("Creating KeyVault...");
-            var keyVaults = resourceGroup.GetKeyVaults();
-            var properties =
-                new KeyVaultProperties(TenantId, new KeyVaultSku(KeyVaultSkuFamily.A, KeyVaultSkuName.Standard));
-            var parameters = new KeyVaultCreateOrUpdateContent(Constants.Location, properties);
-            var operation = await keyVaults.CreateOrUpdateAsync(WaitUntil.Completed, keyVaultName, parameters);
-            var kv = operation.Value;
-            Console.WriteLine($"KeyVault created: Id={kv.Id}");
-            return kv;
-        }
-
-        private static async Task<StorageAccountResource> CreateOrUpdateStorageAccount(ResourceGroupResource resourceGroup, string storageAccountName, StorageSku storageSku, StorageKind storagekind)
-        {
-            Console.WriteLine("Creating storage account...");
-            var parameters =
-                new StorageAccountCreateOrUpdateContent(Constants.StorageSku, Constants.Storagekind, Constants.Location)
-                {
-                    AllowBlobPublicAccess = false
-                };
-
-            var accountCollection = resourceGroup.GetStorageAccounts();
-            var operation = await accountCollection.CreateOrUpdateAsync(WaitUntil.Completed, storageAccountName, parameters);
-            var storageAccount = operation.Value;
-            Console.WriteLine($"Storage account created: Id={storageAccount.Id}");
-            return storageAccount;
-        }
-
-        private static async Task<ResourceGroupResource> CreateOrUpdateResourceGroup(SubscriptionResource subscription, string resourceGroupName)
-        {
-            var operation = await subscription.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed,
-                resourceGroupName,
-                new ResourceGroupData(Constants.Location));
-            var rg = operation.Value;
-            Console.WriteLine($"ResourceGroup created: Id={rg.Id}");
-            return rg;
         }
     }
 }
