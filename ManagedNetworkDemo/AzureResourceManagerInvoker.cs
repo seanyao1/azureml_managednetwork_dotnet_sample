@@ -13,6 +13,19 @@ namespace ManagedNetworkDemo
 {
     public interface IAzureResourceManagerInvoker
     {
+        Task<JObject> GetSubscriptionAsync(Guid subscriptionId);
+        Task CreateResourceGroupAsync(Guid subscriptionId, string resourceGroupName, string locaction);
+        Task<JObject> CreateStorageAccount(Guid subscriptionId, string resourceGroupName, string storageAccountName, string location);
+        Task<JObject> CreateKeyVault(Guid subscriptionId, string resourceGroupName, string keyVaultName, string location, string tenantId);
+        Task<JObject> CreateAzureMLWorkspace(
+                       Guid subscriptionId,
+                       string resourceGroupName,
+                       string workspaceName,
+                       string location,
+                       string storageResourceId,
+                       string kvResourceId,
+                       string appInsightsResourceId);
+       Task<JObject> CallApi(ResourceIdentifier resourceId, HttpMethod method, JObject body, string apiVersion);
     }
 
     public class AzureResourceManagerInvoker : IAzureResourceManagerInvoker
@@ -114,7 +127,7 @@ namespace ManagedNetworkDemo
                         },
                         { "enabledForDeployment", true },
                         { "enabledForDiskEncryption", true},
-                        { "enabledForTemplateDeployment", true},                        
+                        { "enabledForTemplateDeployment", true},
                         { "publicNetworkAccess", "Disabled" }
                     }
                 }
@@ -241,7 +254,7 @@ namespace ManagedNetworkDemo
                 response = await CallApi(resourceId, HttpMethod.Get, null, "2019-06-01");
                 provisioningState = response["properties"]["provisioningState"].Value<string>();
             }
-            
+
             Console.WriteLine($"Provisioning completed. ProvisioningState={provisioningState}");
 
             return response;
@@ -251,7 +264,7 @@ namespace ManagedNetworkDemo
             var operationUri = response.Headers.Location;
             Console.WriteLine($"Polling operation status. OperationUri={operationUri.AbsolutePath}");
             while (true)
-            {                
+            {
                 var request = new HttpRequestMessage(HttpMethod.Get, operationUri);
                 var token = await _tokenFetcher.GetAccessTokenAsync();
                 request.Headers.Add("Authorization", "Bearer " + token);
@@ -272,7 +285,7 @@ namespace ManagedNetworkDemo
                     throw new HttpRequestException($"Error calling API. Status code={operationResponse.StatusCode}");
                 }
             }
-            
+
         }
     }
 }
